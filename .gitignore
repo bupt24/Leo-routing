@@ -1,0 +1,82 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+/venv/
+/.venv/
+/env/
+
+# Test/lint/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Local environment/config and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+.netrc
+.envrc
+credentials*.json
+service-account*.json
+secrets*.json
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.log
+
+# Local datasets (keep data-processing code under src/data/)
+/data/
+/datasets/
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.feather
+
+# Experiment outputs and model artifacts
+/outputs/
+/checkpoints/
+/results/
+/artifacts/
+/runs/
+/wandb/
+/mlruns/
+/lightning_logs/
+/tensorboard/
+*.tfevents.*
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.onnx
+*.safetensors
+*.h5
+*.hdf5
+*.joblib
+
+# Local research documents and scratch files
+/docs/*.doc
+/docs/*.docx
+/docs/*.pdf
+/codex_undo_test.py
+
+# IDE/OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
