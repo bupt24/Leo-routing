@@ -1,391 +1,317 @@
-# LEO卫星网络离线强化学习路由
+# 面向 RLS–CLS 分层卫星网络的多源遥感任务共享策略 MAPPO
 
-基于 **Conservative Q-Learning (CQL)** 和 **GraphSAGE** 的低轨卫星网络最小时延路由方案。支持 Walker-Delta 星座模型与可见性约束。
+本项目研究动态低轨卫星网络中的多源遥感数据回传问题。当前小论文与代码主线是：在 **RLS（遥感卫星层）—CLS（通信/中继卫星层）—ES（地面站）** 分层网络中，使用**参数共享的 MAPPO**，为多个并发遥感任务联合学习 RLS→CLS 接入、CLS 层多跳路由和出口 CLS 入队动作。
 
-## 📁 项目结构
+> 当前核心算法是多源任务共享策略 MAPPO，不是 GraphSAGE + CQL。仓库中仍保留早期 CQL/GraphSAGE 代码用于历史实验追溯，但它们不属于当前小论文的核心方法。
 
-```
-D:\lunwen\
-├── requirements.txt          # Python 依赖
-├── checkpoints/              # 模型权重与训练曲线
-├── data/                     # 数据文件（如有）
-└── src/
-    ├── agents/
-    │   ├── model.py          # GraphSAGE + Q网络 (2层SAGEConv)
-    │   ├── cql_trainer.py    # CQL损失计算与目标网络软更新
-    │   └── train_offline.py  # 训练入口（支持曲线绘制）
-    ├── env/
-    │   ├── topology.py       # Walker-Delta 星座拓扑生成 + 可见性约束
-    │   └── queue_model.py    # M/M/1 排队时延模型
-    ├── eval/
-    │   ├── dijkstra_baseline.py  # Dijkstra 最短路径基线
-    │   └── evaluate.py       # DRL vs Dijkstra 对比评估
-    └── utils/
-        └── offline_dataset.py    # 离线数据集生成器 (Synthetic/LEO/Walker)
+## 研究场景
+
+遥感数据采用以下回传链路：
+
+```mermaid
+flowchart LR
+    T[观测目标] -->|遥感观测| R[RLS 遥感卫星]
+    R -->|共享策略选择接入 CLS| C1[CLS 接入卫星]
+    C1 -->|共享策略逐跳选择| C2[CLS 中继卫星]
+    C2 -->|egress: 选当前 CLS 为出口并入队| Q[出口 CLS 下行队列]
+    Q -->|可见窗口内下传| E[预分配的 ES 地面站]
 ```
 
-## 🚀 快速开始
+- 目标→RLS：依据波束覆盖、观测质量、离轴角和斜距生成观测任务。
+- RLS→CLS：任务智能体在候选接入链路中选择接入 CLS。
+- CLS→CLS：任务智能体根据局部状态、候选边特征和队列竞争逐跳选择下一跳。
+- CLS→ES：目标 ES 在路由开始前已经固定。达到最小中继跳数后，任务智能体可选择 `egress`，将当前 CLS 选为出口并进入其目的地感知下行队列，等待目标 ES 可见。
+- RLS–RLS 链路默认只保留为备份/控制拓扑，不承载观测数据；RLS 不能直接向 ES 下传。
 
-### 1. 创建虚拟环境 (首次运行)
+### 默认场景配置
 
-```powershell
-cd D:\lunwen
-python -m venv venv
-& D:\lunwen\venv\Scripts\Activate.ps1
+配置文件为 [`configs/remote_sensing_scenario.yaml`](configs/remote_sensing_scenario.yaml)。
+
+| 项目 | 当前配置 |
+|---|---|
+| 时隙长度 | 30 s |
+| 观测目标 | 4 个：3 个固定目标、1 个移动目标 |
+| RLS 星座 | 144 星，12×12，580 km，倾角 97.7° |
+| CLS 星座 | 30 星，5×6，1150 km，倾角 53° |
+| ES 地面站 | 5 个 |
+| 最大并发任务数 | 4 |
+| RLS→CLS 候选数 | 每个 RLS 最多 4 个 |
+| 最小 CLS 中继跳数 | 1 |
+| 观测波束 | 可转向；每颗 RLS 最多 2 束，每个目标最多 3 颗候选 RLS |
+| 路由代价权重 | 时延 0.4、能耗 0.2、队列 0.3、丢包 0.1 |
+
+默认生成三类异构任务：
+
+| 任务类型 | 数据量 | 优先级 | 截止期 | 生成概率 |
+|---|---:|---:|---:|---:|
+| `urgent` | 5–10 MB | 0 | 60 s | 0.2 |
+| `normal` | 20–50 MB | 1 | 180 s | 0.5 |
+| `bulk` | 80–150 MB | 2 | 600 s | 0.3 |
+
+每个业务时隙中，每个被观测目标可生成一个任务。系统优先为不同任务分配不同 RLS，资源不足时允许 RLS 复用；每个任务在路由前根据路径时延、出口可达性、可见窗口和已分配负载确定一个目标 ES。
+
+## 共享策略 MAPPO
+
+### 智能体定义
+
+环境按**任务**组织智能体：每个并发遥感任务对应一条 agent 轨迹，所有任务共享同一组 Actor 参数。CLS 卫星是候选路由节点，而不是每颗卫星各维护一套独立策略；RLS 本身也不是独立智能体。
+
+当前实现采用参数共享 Actor 与集中式 Critic 的 **CTDE 风格结构**。执行端还使用其他任务竞争压力、GS 队列负载和未来链路可见性预测等系统信息；这些信息的可获得性属于当前仿真假设，因此不将其表述为已证明的严格分散执行。
+
+- **共享 Actor**：编码任务局部观测和每条候选边特征，对当前合法动作逐一打分。
+- **集中式 Critic**：使用全局状态估计状态价值，训练时刻画多任务竞争、CLS 队列和 ES 服务能力。
+- **动作掩码**：屏蔽不存在或非法的接入、ISL 和 egress 动作。
+- **PPO 更新**：使用 GAE、裁剪目标、熵正则、价值损失和梯度裁剪。
+
+当前配置下的输入/动作维度如下：
+
+| 项目 | 维度 | 主要内容 |
+|---|---:|---|
+| 任务局部观测 | 24 | 当前节点、源 RLS、目标 ES、任务大小/类别/剩余期限、累计时延、队列状态、路由阶段和跳数进度 |
+| 候选动作特征 | 18 | 动作类型、相对位置、距离、时延、能耗、丢包、队列容量、竞争压力、ES 可达性及服务能力 |
+| 动作空间 | 5 | 接入阶段最多 4 个接入动作；中继阶段最多 4 个 ISL 动作及 1 个 egress 动作 |
+| 集中式全局状态 | 77 | CLS 队列统计、ES 负载与预测服务能力、业务组成及所有活动任务摘要 |
+
+### 决策过程
+
+1. 任务在源 RLS 处选择一条 RLS→CLS 接入边。
+2. 进入 CLS 层后，从未访问的合法 ISL 邻居中选择下一跳。
+3. 达到最小中继跳数且预测存在目标 ES 下行机会时，可选择 `egress`。
+4. 数据进入出口 CLS 的分类下行队列；调度器先服务最高优先级业务，再在同优先级的可服务队列之间按 WPQ 权重分配服务时间。
+5. 任务在截止期内完成下传则成功，否则按超时、TTL、队列竞争或溢出等原因失败。
+
+### 奖励设计
+
+接入和 ISL 决策采用归一化加权代价：
+
+```text
+r_step = -(0.4 × delay + 0.2 × energy + 0.3 × queue + 0.1 × loss)
 ```
 
-### 2. 安装依赖
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe -m pip install -r D:\lunwen\requirements.txt
-```
-
-> 需要：`torch`、`torch-geometric`、`matplotlib`
-
-### 3. 训练模型
-
-#### 方式一：基础 LEO 拓扑训练
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_offline.py `
-    --epochs 50 `
-    --batches-per-epoch 20 `
-    --dataset leo `
-    --num-sats 120 `
-    --num-gateways 6
-```
-
-#### 方式二：Walker-Delta 星座训练（推荐）
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_offline.py `
-    --epochs 50 `
-    --batches-per-epoch 20 `
-    --dataset walker `
-    --num-planes 6 `
-    --sats-per-plane 10 `
-    --inclination-deg 53.0 `
-    --use-visibility
-```
-
-### 4. 训练输出
-
-训练完成后会在 `checkpoints/` 目录生成：
-
-| 文件 | 说明 |
-|------|------|
-| `leo_routing_epoch50.pt` | 模型权重 |
-| `training_history_epoch50.json` | 训练历史数据 (JSON) |
-| `training_curves_epoch50.png` | Loss/Reward 曲线图 |
-
-### 5. 评估对比
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\eval\evaluate.py `
-    --checkpoint D:\lunwen\checkpoints\leo_routing_epoch50.pt `
-    --num-samples 100
-```
-
-### 6. 查看训练曲线
-
-```powershell
-Start-Process D:\lunwen\checkpoints\training_curves_epoch50.png
-```
-
-## ⚙️ 完整参数说明
-
-### 通用参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--epochs` | 训练轮数 | 3 |
-| `--batches-per-epoch` | 每轮批次数 | 10 |
-| `--batch-size` | 批次大小 | 128 |
-| `--dataset` | 数据集类型 (`synthetic`/`leo`/`walker`) | synthetic |
-| `--num-gateways` | 地面站数量 | 6 |
-| `--max-neighbors` | 最大邻居数（动作空间维度） | 4 |
-| `--altitude-km` | 轨道高度 (km) | 550.0 |
-
-### 模型参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--node-feature-dim` | 节点特征维度 | 10 |
-| `--hidden-dim` | 隐藏层维度 | 64 |
-| `--action-dim` | 动作空间维度 | 4 |
-| `--lr` | 学习率 | 1e-3 |
-| `--gamma` | 折扣因子 | 0.99 |
-| `--cql-alpha` | CQL 正则化权重 | 1.0 |
-| `--tau` | 目标网络软更新系数 | 0.005 |
-| `--grad-clip` | 梯度裁剪阈值 | 1.0 |
-
-### LEO 数据集参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--num-sats` | 卫星数量 | 120 |
-
-### Walker 星座参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--num-planes` | 轨道面数量 | 6 |
-| `--sats-per-plane` | 每轨道卫星数 | 10 |
-| `--inclination-deg` | 轨道倾角 (度) | 53.0 |
-| `--use-visibility` | 启用可见性约束 (LOS + 仰角) | False |
-
-## 🔬 技术细节
-
-### 网络架构
-
-- **图编码器**: 2层 GraphSAGE (SAGEConv)，捕获二跳邻域拥塞信息
-- **Q网络**: MLP (hidden_dim → hidden_dim → action_dim)
-- **离线算法**: Conservative Q-Learning (CQL)，通过 logsumexp 正则化防止 Q 值过估计
-
-### Walker-Delta 星座模型
-
-- 支持轨道力学计算（开普勒轨道）
-- 星间链路 (ISL) 可见性约束：
-  - 视线遮挡检测（地球遮挡）
-  - 最小仰角约束（默认 25°）
-- 时间演化拓扑
-
-### 时延模型
-
-- **传播时延**: 基于欧氏距离
-- **排队时延**: M/M/1 模型，考虑链路利用率
-
-## 📊 示例输出
-
-```
-Epoch 1 | Loss: 212.4336 | Avg Reward: -13.5543
-Epoch 2 | Loss: 227.5920 | Avg Reward: -13.8444
-...
-Epoch 50 | Loss: 185.2102 | Avg Reward: -10.2315
-模型已保存至: checkpoints/leo_routing_epoch50.pt
-训练曲线图已保存至: checkpoints/training_curves_epoch50.png
-```
-
-## 📝 下一步建议
-
-- [ ] 用真实仿真轨迹数据替换随机动作采样
-- [ ] 实现多跳路由仿真评估
-- [ ] 添加多算法对比曲线（GraphPR/MAFDR/POMAP）
-- [ ] 引入图采样（邻居采样）以扩展到更大星座
-- [ ] 添加星座拓扑可视化
-
-## 📚 参考文献
-
-- [CQL: Conservative Q-Learning for Offline Reinforcement Learning](https://arxiv.org/abs/2006.04779)
-- [GraphSAGE: Inductive Representation Learning on Large Graphs](https://arxiv.org/abs/1706.02216)
-# LEO 卫星网络离线路由学习
-
-基于 GraphSAGE + Conservative Q-Learning (CQL) 的低轨卫星路由实验工程，支持多种离线数据源：
-- synthetic 随机图数据
-- leo 随机卫星/地面站拓扑
-- walker Walker-Delta 星座拓扑（可见性约束）
-- real 真实 Starlink TLE 数据
-- precomputed 预计算专家轨迹数据
+egress 决策考虑预测等待时隙与出口队列占用。任务成功时获得成功奖励并扣除归一化端到端时延；任务失败、非法动作、CLS 队列竞争和下行队列溢出均受到惩罚。
 
 ## 项目结构
 
 ```text
-D:\lunwen
-├── README.md
-├── requirements.txt
-├── data/
-│   ├── offline_trajectories.pkl
-│   └── tle/
-├── checkpoints/
-└── src/
-    ├── agents/
-    │   ├── model.py
-    │   ├── cql_trainer.py
-    │   ├── train_offline.py
-    │   ├── train_supervised.py
-    │   ├── train_geometric.py
-    │   └── evaluate.py
-    ├── env/
-    │   ├── topology.py
-    │   └── queue_model.py
-    ├── data/
-    │   ├── download_tle.py
-    │   ├── real_dataset.py
-    │   └── precompute_dataset.py
-    ├── eval/
-    │   ├── dijkstra_baseline.py
-    │   └── evaluate.py
-    └── utils/
-        └── offline_dataset.py
+Leo-routing/
+├── configs/
+│   └── remote_sensing_scenario.yaml       # RLS–CLS–ES 场景与任务参数
+├── figures/                               # 选定并提交到仓库的实验图
+├── scripts/
+│   ├── run_remote_sensing_scenario.py     # 确定性场景/Dijkstra 仿真
+│   ├── run_remote_sensing_dijkstra.py     # Dijkstra 基线
+│   ├── run_remote_sensing_random_baseline.py
+│   ├── 02run_remote_sensing_random_baseline.py
+│   ├── 03run_remote_sensing_random_baseline.py
+│   ├── 04run_remote_sensing_random_baseline.py
+│   └── plot/                              # 训练和基线曲线脚本
+├── src/
+│   ├── agents/MAPPO/
+│   │   ├── remote_sensing_agent_env.py    # 并发多源任务环境
+│   │   ├── vanilla_mappo.py               # 共享 Actor、集中式 Critic 与 PPO
+│   │   ├── train_mappo_remote_sensing.py  # MAPPO 训练实现
+│   │   └── evaluate_mappo_remote_sensing.py
+│   ├── env/
+│   │   ├── remote_sensing_scenario.py     # 动态分层星座与链路建模
+│   │   ├── remote_sensing_task_core.py    # 任务生成、GS 选择及下行队列
+│   │   ├── remote_sensing_random_baseline.py
+│   │   └── beam_model.py
+│   └── agents/                            # 兼容入口与早期实验模块
+├── tests/                                 # 单元测试
+└── requirements.txt
 ```
 
 ## 环境准备
 
-```powershell
-cd D:\lunwen
-python -m venv venv
-& D:\lunwen\venv\Scripts\Activate.ps1
-& D:\lunwen\venv\Scripts\python.exe -m pip install -r D:\lunwen\requirements.txt
+```bash
+git clone https://github.com/bupt24/Leo-routing.git
+cd Leo-routing
+
+python -m venv .venv
+source .venv/bin/activate        # Linux/macOS
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## 训练入口
+Windows PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活虚拟环境。
 
-### 1) CQL 离线训练（主入口）
+如不显式传入 `--device`，训练和评估脚本会自动选择 CUDA；CUDA 不可用时回退到 CPU。
 
-脚本：`src/agents/train_offline.py`
+## 快速开始
 
-LEO 示例：
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_offline.py `
-  --dataset leo `
-  --epochs 50 `
-  --batches-per-epoch 20 `
-  --num-sats 120 `
-  --num-gateways 6
+以下命令均从项目根目录执行。
+
+### 1. 环境冒烟测试
+
+```bash
+python src/agents/train_mappo_remote_sensing.py \
+  --config configs/remote_sensing_scenario.yaml \
+  --episodes 3 \
+  --time-slots 10 \
+  --eval-episodes 1 \
+  --device cpu \
+  --output-dir outputs/remote_sensing_mappo/smoke_test
 ```
 
-Walker 示例：
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_offline.py `
-  --dataset walker `
-  --epochs 50 `
-  --batches-per-epoch 20 `
-  --num-planes 6 `
-  --sats-per-plane 10 `
-  --inclination-deg 53.0 `
-  --use-visibility
+### 2. 训练共享策略 MAPPO
+
+```bash
+python src/agents/train_mappo_remote_sensing.py \
+  --config configs/remote_sensing_scenario.yaml \
+  --episodes 300 \
+  --time-slots 200 \
+  --ttl-cap 8 \
+  --num-envs 1 \
+  --output-dir outputs/remote_sensing_mappo/paper_run
 ```
 
-precomputed 示例（推荐做稳定训练）：
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_offline.py `
-  --dataset precomputed `
-  --epochs 50 `
-  --batches-per-epoch 50
-```
-
-real TLE 示例：
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_offline.py `
-  --dataset real `
-  --num-sats 100 `
-  --use-expert `
-  --expert-ratio 0.7
-```
-
-### 2) 监督学习（行为克隆）
-
-脚本：`src/agents/train_supervised.py`
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_supervised.py `
-  --epochs 50 `
-  --batch-size 256 `
-  --batches-per-epoch 100
-```
-
-### 3) 几何模型训练
-
-脚本：`src/agents/train_geometric.py`
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\agents\train_geometric.py `
-  --data-path D:\lunwen\data\offline_trajectories.pkl `
-  --checkpoint-dir D:\lunwen\checkpoints `
-  --epochs 50
-```
-
-## 评估入口
-
-脚本：`src/eval/evaluate.py`
-
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\eval\evaluate.py `
-  --checkpoint D:\lunwen\checkpoints\leo_routing_epoch50.pt `
-  --num-samples 100
-```
-
-注意：当前评估脚本中的 DRL 指标是“单跳时延”，Dijkstra 是“端到端时延”，两者用于快速对照，不是严格同口径多跳比较。
-
-## 数据准备
-
-下载并解析 Starlink TLE：
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\data\download_tle.py
-```
-
-预生成离线专家轨迹：
-```powershell
-& D:\lunwen\venv\Scripts\python.exe D:\lunwen\src\data\precompute_dataset.py
-```
-
-## 输出文件
-
-`train_offline.py` 典型输出：
-- `checkpoints/leo_routing_best.pt`
-- `checkpoints/leo_routing_epoch{N}.pt`
-- `checkpoints/training_history_epoch{N}.json`
-- `checkpoints/training_curves_epoch{N}.png`
-
-`train_supervised.py` 典型输出：
-- `checkpoints/leo_routing_best.pt`
-- `checkpoints/leo_routing_supervised.pt`
-- `checkpoints/supervised_training.png`
-
-`train_geometric.py` 典型输出：
-- `checkpoints/geo_router_best.pt`
-- `checkpoints/geo_training.png`
-
-## 参数说明（train_offline.py）
-
-### 核心参数
+常用参数：
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
-| `--dataset` | `synthetic` | `synthetic/leo/walker/real/precomputed` |
-| `--epochs` | `3` | 训练轮数 |
-| `--batches-per-epoch` | `10` | 每轮 batch 数 |
-| `--batch-size` | `128` | 批大小 |
-| `--lr` | `3e-4` | 学习率 |
-| `--gamma` | `0.99` | 折扣因子 |
-| `--cql-alpha` | `0.5` | CQL 正则权重 |
-| `--tau` | `0.005` | 目标网络软更新系数 |
-| `--grad-clip` | `1.0` | 梯度裁剪阈值 |
-| `--patience` | `15` | 早停耐心轮数 |
+| `--episodes` | 1000 | 训练轮数 |
+| `--time-slots` | 10 | 每轮生成任务的时隙数 |
+| `--ttl-cap` | 10 | CLS ISL 跳数 TTL；达到该值时判定超限失败 |
+| `--num-envs` | 1 | 并行环境数 |
+| `--env-cache` | `memory` | 是否缓存动态拓扑快照 |
+| `--hidden-dim` | 128 | Actor/Critic 隐层维度 |
+| `--lr` | `1e-4` | 学习率 |
+| `--gamma` | 0.99 | 折扣因子 |
+| `--gae-lambda` | 0.95 | GAE 参数 |
+| `--clip-ratio` | 0.2 | PPO 裁剪范围 |
+| `--eval-interval` | 50 | 确定性评估间隔 |
+| `--checkpoint-interval` | 10 | checkpoint 保存间隔 |
 
-### 拓扑与模型参数
+训练输出位于 `outputs/remote_sensing_mappo/<run>/`：
 
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `--num-sats` | `120` | 卫星数量（leo/real） |
-| `--num-gateways` | `6` | 地面站数量 |
-| `--max-neighbors` | `4` | 最大邻居数 |
-| `--altitude-km` | `550.0` | 轨道高度 |
-| `--node-feature-dim` | `10` | 节点特征维度 |
-| `--hidden-dim` | `64` | 隐层维度 |
-| `--action-dim` | `4` | 动作维度 |
-| `--num-planes` | `6` | Walker 轨道面数 |
-| `--sats-per-plane` | `10` | Walker 每面卫星数 |
-| `--inclination-deg` | `53.0` | Walker 倾角 |
-| `--use-visibility` | `False` | Walker 是否启用可见性约束 |
-| `--use-expert` | `False` | real 数据是否混入专家动作 |
-| `--expert-ratio` | `0.7` | 专家动作占比 |
+```text
+latest.pt
+best.pt                         # 执行评估且刷新最佳 eval_reward 后生成
+mappo_training_metrics.csv
+mappo_training_curves.png
+training_summary.json
+```
 
-## 参数说明（eval/evaluate.py）
+### 3. 评估 MAPPO
 
-| 参数 | 默认值 |
-|---|---:|
-| `--checkpoint` | `None` |
-| `--num-samples` | `100` |
-| `--num-sats` | `120` |
-| `--num-gateways` | `6` |
-| `--max-neighbors` | `4` |
-| `--altitude-km` | `550.0` |
-| `--node-feature-dim` | `10` |
-| `--hidden-dim` | `64` |
-| `--action-dim` | `4` |
+```bash
+python src/agents/evaluate_mappo_remote_sensing.py \
+  --checkpoint outputs/remote_sensing_mappo/paper_run/best.pt \
+  --config configs/remote_sensing_scenario.yaml \
+  --episodes 100 \
+  --time-slots 600 \
+  --ttl-cap 8
+```
 
-## 参考
+评估输出位于 `outputs/remote_sensing_mappo_eval/<run>/`：
 
-- [CQL: Conservative Q-Learning for Offline Reinforcement Learning](https://arxiv.org/abs/2006.04779)
-- [GraphSAGE: Inductive Representation Learning on Large Graphs](https://arxiv.org/abs/1706.02216)
+```text
+mappo_routes.csv
+mappo_episode_metrics.csv
+mappo_downlink_queues.csv
+mappo_evaluation_summary.json
+```
+
+### 4. 运行对比基线
+
+Dijkstra：
+
+```bash
+python scripts/run_remote_sensing_dijkstra.py \
+  --config configs/remote_sensing_scenario.yaml \
+  --time-slots 600 \
+  --ttl-cap 8 \
+  --random-seed 42
+```
+
+Random01：
+
+```bash
+python scripts/run_remote_sensing_random_baseline.py \
+  --config configs/remote_sensing_scenario.yaml \
+  --time-slots 600 \
+  --ttl-cap 8 \
+  --random-seed 42
+```
+
+其他随机变体分别使用：
+
+```bash
+python scripts/02run_remote_sensing_random_baseline.py --time-slots 600
+python scripts/03run_remote_sensing_random_baseline.py --time-slots 600 --max-attempts 8
+python scripts/04run_remote_sensing_random_baseline.py --time-slots 600 --max-attempts 8
+```
+
+为了保证论文比较公平，应让 MAPPO、Dijkstra 和随机基线使用相同的 YAML、时隙数、TTL、随机种子集合与指标口径。
+MAPPO 示例按多个 episode 评估，而基线 CLI 每次运行一次指定时长的仿真；正式比较时应对基线逐个运行同一组种子，再按相同统计单位聚合。
+
+### 5. 重新绘制 MAPPO 曲线
+
+```bash
+python scripts/plot/run_mappo_training_curves.py \
+  --metrics-csv outputs/remote_sensing_mappo/paper_run/mappo_training_metrics.csv \
+  --output-dir outputs/remote_sensing_mappo/paper_run \
+  --prefix paper_mappo \
+  --x-axis episode \
+  --dpi 300
+```
+
+## 指标说明
+
+| 指标 | 含义 |
+|---|---|
+| `success_rate` | 成功送达任务数 / 总任务数 |
+| `deadline_meeting_rate` | 截止期内完成任务的比例；当前实现中与 `success_rate` 相同 |
+| `avg_delay_success_ms` | 成功任务平均端到端时延 |
+| `avg_delay_actual_all_ms` | 全部任务的实际平均累计时延 |
+| `avg_cls_delay_success_ms` | 成功任务的 RLS→CLS 接入及 CLS 中继累计时延，不含下行等待/服务 |
+| `avg_energy_success_j` | 成功任务平均能耗 |
+| `avg_loss_success` | 成功任务平均累计丢包风险 |
+| `avg_reward_all` | 所有任务的平均累计奖励 |
+| `throughput_mbps` | 成功交付数据量除以任务生成阶段时长；分母不含 drain slots |
+
+训练 CSV 还记录 `policy_loss`、`value_loss`、`entropy` 和 `total_loss`；按评估间隔记录 `eval_reward`、`eval_delay` 和 `eval_success_rate`。
+
+## 已提交的实验图
+
+### 历史 300 轮 MAPPO 训练时延
+
+![MAPPO 训练时延](figures/mappo_training_delay_300_episodes.png)
+
+### Random 基线时延（100-episode 窗口平均）
+
+![Random 基线时延](figures/random_baseline_delay_avg100.png)
+
+上述图片用于展示仓库中已有实验趋势。当前环境使用 `multi_source_concurrent_v2` schema；论文最终结果应由当前代码在统一场景、种子和指标口径下重新生成，不应仅凭两张历史曲线直接得出算法优劣结论。
+
+## 测试
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover \
+  -s tests \
+  -p 'test_*.py' \
+  -v
+```
+
+测试覆盖多源任务生成、RLS 接入、CLS 路由、队列服务、随机基线、动作掩码、GAE 和 PPO 参数更新等关键逻辑。
+
+## 早期 CQL/GraphSAGE 模块
+
+以下文件属于早期离线强化学习实验，继续保留以便追溯和对照：
+
+- `src/agents/model.py`
+- `src/agents/cql_trainer.py`
+- `src/agents/train_offline.py`
+- `src/utils/offline_dataset.py`
+
+它们不是当前 RLS–CLS 多源遥感任务论文的核心算法。论文方法、实验设计和结果分析应以 `src/agents/MAPPO/` 下的共享策略 MAPPO 及对应多源环境为准。
+
+## 数据与训练产物
+
+仓库通过 `.gitignore` 排除本地数据集、模型权重、虚拟环境和大规模训练输出，包括 `data/`、`outputs/`、`checkpoints/`、`*.pt`、`*.pth`、`*.pkl` 等。需要共享实验结果时，建议只提交经过筛选的图表或使用独立的发布/对象存储。
+
+## 参考文献
+
+- Yu et al., [The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games](https://arxiv.org/abs/2103.01955)
+- Schulman et al., [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
