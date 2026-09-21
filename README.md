@@ -4,6 +4,18 @@
 
 > 当前核心算法是多源任务共享策略 MAPPO，不是 GraphSAGE + CQL。仓库中仍保留早期 CQL/GraphSAGE 代码用于历史实验追溯，但它们不属于当前小论文的核心方法。
 
+## 目录
+
+- [研究场景](#研究场景)
+- [共享策略 MAPPO](#共享策略-mappo)
+- [项目结构](#项目结构)
+- [环境准备](#环境准备)
+- [快速开始](#快速开始)
+- [对比基线](#对比基线)
+- [指标说明](#指标说明)
+- [常见问题排查](#常见问题排查)
+- [早期 CQL/GraphSAGE 模块](#早期-cqlgraphsag-模块)
+
 ## 研究场景
 
 遥感数据采用以下回传链路：
@@ -39,6 +51,9 @@ flowchart LR
 | 最小 CLS 中继跳数 | 1 |
 | 观测波束 | 可转向；每颗 RLS 最多 2 束，每个目标最多 3 颗候选 RLS |
 | 路由代价权重 | 时延 0.4、能耗 0.2、队列 0.3、丢包 0.1 |
+| GS 选择权重 | 路径时延 0.35、出口可达性 0.20、可见窗口 0.20、已分配负载 0.25 |
+| 下行队列 | 3 个优先级，容量 `[20000, 50000, 100000]`，WPQ 权重 `[1.0, 1.0, 1.0]` |
+| GS 前瞻 | 20 时隙；排空阶段 20 时隙 |
 
 默认生成三类异构任务：
 
@@ -98,30 +113,53 @@ Leo-routing/
 │   └── remote_sensing_scenario.yaml       # RLS–CLS–ES 场景与任务参数
 ├── figures/                               # 选定并提交到仓库的实验图
 ├── scripts/
-│   ├── run_remote_sensing_scenario.py     # 确定性场景/Dijkstra 仿真
-│   ├── run_remote_sensing_dijkstra.py     # Dijkstra 基线
-│   ├── run_remote_sensing_random_baseline.py
-│   ├── 02run_remote_sensing_random_baseline.py
-│   ├── 03run_remote_sensing_random_baseline.py
-│   ├── 04run_remote_sensing_random_baseline.py
+│   ├── remote_sensing_random_cli.py       # Random01–04 / Dijkstra 共用 CLI
+│   ├── run_remote_sensing_scenario.py     # 确定性场景仿真
+│   ├── run_remote_sensing_dijkstra.py     # Dijkstra 基线入口
+│   ├── run_remote_sensing_random_baseline.py  # Random01 基线入口
+│   ├── 0{1,2,3,4}run_remote_sensing_random_baseline.py  # Random01–04 编号入口
+│   ├── check_remote_sensing_beam_model.py # 波束模型输出校验
+│   ├── check_remote_sensing_coordinates.py # 坐标框架与地面运动不变量校验
 │   └── plot/                              # 训练和基线曲线脚本
 ├── src/
-│   ├── agents/MAPPO/
-│   │   ├── remote_sensing_agent_env.py    # 并发多源任务环境
-│   │   ├── vanilla_mappo.py               # 共享 Actor、集中式 Critic 与 PPO
-│   │   ├── train_mappo_remote_sensing.py  # MAPPO 训练实现
-│   │   └── evaluate_mappo_remote_sensing.py
+│   ├── agents/
+│   │   ├── MAPPO/                         # ★ 当前核心实现
+│   │   │   ├── remote_sensing_agent_env.py    # 并发多源任务环境
+│   │   │   ├── vanilla_mappo.py               # 共享 Actor、集中式 Critic 与 PPO
+│   │   │   ├── train_mappo_remote_sensing.py  # MAPPO 训练实现
+│   │   │   ├── evaluate_mappo_remote_sensing.py
+│   │   │   ├── remote_sensing_dijkstra.py     # Dijkstra 路由实现
+│   │   │   ├── remote_sensing_route_metrics.py
+│   │   │   └── test_*.py                      # 该模块的伴随测试
+│   │   ├── train_mappo_remote_sensing.py  # ← 兼容入口，转发到 MAPPO/
+│   │   ├── evaluate_mappo_remote_sensing.py # ← 兼容入口
+│   │   ├── vanilla_mappo.py               # ← 兼容 shim
+│   │   └── ...                            # 早期实验模块，见文末
 │   ├── env/
-│   │   ├── remote_sensing_scenario.py     # 动态分层星座与链路建模
+│   │   ├── remote_sensing_scenario.py     # 动态分层星座与链路建模（主线）
 │   │   ├── remote_sensing_task_core.py    # 任务生成、GS 选择及下行队列
-│   │   ├── remote_sensing_random_baseline.py
-│   │   └── beam_model.py
-│   └── agents/                            # 兼容入口与早期实验模块
-├── tests/                                 # 单元测试
+│   │   ├── remote_sensing_random_baseline.py  # Random01–04 共享仿真核心
+│   │   ├── remote_sensing_route_metrics.py
+│   │   ├── beam_model.py                  # 观测波束与质量惩罚
+│   │   ├── coordinate_utils.py            # 坐标框架转换
+│   │   ├── aqm_wpq.py                     # AQM 与 WPQ 队列逻辑
+│   │   ├── topology.py                    # Walker 星座拓扑构建（被主线引用）
+│   │   ├── link_model.py                  # 链路时延/能耗模型（被主线引用）
+│   │   ├── queue_model.py                 # 队列时延模型（被主线引用）
+│   │   ├── 0{1,2,3,4}remote_sensing_random_baseline.py  # 变体薄封装
+│   │   └── leo_routing_env.py             # 早期离线 RL 环境
+│   ├── data/                              # TLE 下载与离线数据集采样
+│   ├── eval/                              # Dijkstra 基线与早期评估脚本
+│   └── utils/                             # 早期离线数据集工具
+├── tests/                                 # 单元测试（24 项）
 └── requirements.txt
 ```
 
+> **关于顶层 `src/agents/*.py`**：这些文件是转发到 `src/agents/MAPPO/` 的兼容入口（部分只有几行 `from agents.MAPPO.xxx import *`），保留是为了让旧命令继续可用。**改动算法请直接编辑 `src/agents/MAPPO/` 下的文件**，否则会被兼容层忽略。
+
 ## 环境准备
+
+依赖仅需 `torch`、`torch-geometric`、`matplotlib` 和 `requests`（见 [`requirements.txt`](requirements.txt)）。其中 `torch-geometric` 只被早期 GraphSAGE 模块使用，`requests` 只被 TLE 下载脚本使用；只跑 MAPPO 主线时二者非必需。
 
 ```bash
 git clone https://github.com/bupt24/Leo-routing.git
@@ -143,6 +181,8 @@ Windows PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活虚拟环境。
 以下命令均从项目根目录执行。
 
 ### 1. 环境冒烟测试
+
+用 3 个 episode、每轮 10 个时隙确认环境与训练循环可跑通：
 
 ```bash
 python src/agents/train_mappo_remote_sensing.py \
@@ -172,24 +212,39 @@ python src/agents/train_mappo_remote_sensing.py \
 |---|---:|---|
 | `--episodes` | 1000 | 训练轮数 |
 | `--time-slots` | 10 | 每轮生成任务的时隙数 |
+| `--eval-time-slots` | 0 | 评估阶段时隙数；0 表示与 `--time-slots` 相同 |
+| `--base-seed` | 42 | 随机种子基准 |
 | `--ttl-cap` | 10 | CLS ISL 跳数 TTL；达到该值时判定超限失败 |
-| `--num-envs` | 1 | 并行环境数 |
-| `--env-cache` | `memory` | 是否缓存动态拓扑快照 |
+| `--drain-slots` | -1 | 排空时隙数；-1 表示沿用配置文件 |
+| `--num-envs` | 1 | 每轮创建的环境实例数；当前实现批量进行策略推理，但依次执行各环境的 `step()`，不启用多进程 |
+| `--env-cache` | `memory` | 是否缓存动态拓扑快照（`off` / `memory`） |
 | `--hidden-dim` | 128 | Actor/Critic 隐层维度 |
 | `--lr` | `1e-4` | 学习率 |
 | `--gamma` | 0.99 | 折扣因子 |
 | `--gae-lambda` | 0.95 | GAE 参数 |
 | `--clip-ratio` | 0.2 | PPO 裁剪范围 |
+| `--value-coef` | 0.5 | 价值损失系数 |
+| `--entropy-coef` | 0.05 | 熵正则系数 |
+| `--max-grad-norm` | 0.5 | 梯度裁剪范数 |
+| `--update-epochs` | 2 | 每批数据的 PPO 更新轮数 |
+| `--minibatch-size` | 2048 | 小批量大小 |
+| `--eval-episodes` | 3 | 每次确定性评估的 episode 数 |
 | `--eval-interval` | 50 | 确定性评估间隔 |
 | `--checkpoint-interval` | 10 | checkpoint 保存间隔 |
+| `--output-root` | `outputs/remote_sensing_mappo` | 输出根目录 |
+| `--output-dir` | 空 | 指定完整输出目录；留空则在 `--output-root` 下按时间戳生成 |
+| `--device` | 空 | 空表示自动选择 CUDA/CPU |
+| `--no-plot` | 关闭 | 传该标志可跳过训练曲线绘制 |
+
+当前版本不支持 `--rollout-mode` 和 `--rollout-workers`；含 `mode=mp workers=2` 的历史日志来自旧版脚本。
 
 训练输出位于 `outputs/remote_sensing_mappo/<run>/`：
 
 ```text
-latest.pt
-best.pt                         # 执行评估且刷新最佳 eval_reward 后生成
+latest.pt                       # 每个 checkpoint 间隔覆盖
+best.pt                         # 仅当评估刷新最佳 eval_reward 时生成
 mappo_training_metrics.csv
-mappo_training_curves.png
+mappo_training_curves.png       # 除非传 --no-plot
 training_summary.json
 ```
 
@@ -204,6 +259,8 @@ python src/agents/evaluate_mappo_remote_sensing.py \
   --ttl-cap 8
 ```
 
+评估脚本参数与训练基本对齐：`--checkpoint`（必填）、`--config`、`--episodes`、`--time-slots`、`--base-seed`、`--ttl-cap`、`--drain-slots`、`--output-dir`、`--device`。
+
 评估输出位于 `outputs/remote_sensing_mappo_eval/<run>/`：
 
 ```text
@@ -213,40 +270,7 @@ mappo_downlink_queues.csv
 mappo_evaluation_summary.json
 ```
 
-### 4. 运行对比基线
-
-Dijkstra：
-
-```bash
-python scripts/run_remote_sensing_dijkstra.py \
-  --config configs/remote_sensing_scenario.yaml \
-  --time-slots 600 \
-  --ttl-cap 8 \
-  --random-seed 42
-```
-
-Random01：
-
-```bash
-python scripts/run_remote_sensing_random_baseline.py \
-  --config configs/remote_sensing_scenario.yaml \
-  --time-slots 600 \
-  --ttl-cap 8 \
-  --random-seed 42
-```
-
-其他随机变体分别使用：
-
-```bash
-python scripts/02run_remote_sensing_random_baseline.py --time-slots 600
-python scripts/03run_remote_sensing_random_baseline.py --time-slots 600 --max-attempts 8
-python scripts/04run_remote_sensing_random_baseline.py --time-slots 600 --max-attempts 8
-```
-
-为了保证论文比较公平，应让 MAPPO、Dijkstra 和随机基线使用相同的 YAML、时隙数、TTL、随机种子集合与指标口径。
-MAPPO 示例按多个 episode 评估，而基线 CLI 每次运行一次指定时长的仿真；正式比较时应对基线逐个运行同一组种子，再按相同统计单位聚合。
-
-### 5. 重新绘制 MAPPO 曲线
+### 4. 重新绘制 MAPPO 曲线
 
 ```bash
 python scripts/plot/run_mappo_training_curves.py \
@@ -255,6 +279,50 @@ python scripts/plot/run_mappo_training_curves.py \
   --prefix paper_mappo \
   --x-axis episode \
   --dpi 300
+```
+
+`scripts/plot/` 下另有基线曲线脚本：`run_random_episode_delay_curve.py`、`run_random_avg100_delay_curve.py`、`run_random03_episode_delay_curve.py`、`run_random04_episode_delay_curve.py`，以及按时间隙汇总端到端时延与能耗的 `analyze_end_to_end_slot_metrics.py`。
+
+## 对比基线
+
+所有基线共用 [`scripts/remote_sensing_random_cli.py`](scripts/remote_sensing_random_cli.py)，共用参数为 `--config`、`--time-slots`、`--random-seed`、`--ttl-cap`、`--ttl-margin`、`--drain-slots`、`--output-dir`；`--max-attempts` 仅对 Random03/04 生效（默认 8）。
+
+| 变体 | 入口 | 路由行为 |
+|---|---|---|
+| Dijkstra | `scripts/run_remote_sensing_dijkstra.py` | 按链路代价求最短路径 |
+| Random01 | `scripts/run_remote_sensing_random_baseline.py`<br>`scripts/01run_remote_sensing_random_baseline.py` | 随机路由，带前瞻（不主动走进死胡同） |
+| Random02 | `scripts/02run_remote_sensing_random_baseline.py` | 随机路由，无前瞻，可能进入死胡同后失败 |
+| Random03 | `scripts/03run_remote_sensing_random_baseline.py` | 在随机接入基础上允许重试，累计失败尝试的时延与能耗 |
+| Random04 | `scripts/04run_remote_sensing_random_baseline.py` | 重试变体，接入决策按协作打分选择（考虑队列与剩余容量） |
+
+> Random01 与 Random02 的差别正是「是否前瞻」，做消融或基线对比时请明确说明选中哪一个，二者成功率差异较大。
+
+示例：
+
+```bash
+python scripts/run_remote_sensing_dijkstra.py \
+  --config configs/remote_sensing_scenario.yaml \
+  --time-slots 600 --ttl-cap 8 --random-seed 42
+
+python scripts/run_remote_sensing_random_baseline.py \
+  --config configs/remote_sensing_scenario.yaml \
+  --time-slots 600 --ttl-cap 8 --random-seed 42
+
+python scripts/03run_remote_sensing_random_baseline.py --time-slots 600 --max-attempts 8
+python scripts/04run_remote_sensing_random_baseline.py --time-slots 600 --max-attempts 8
+```
+
+为了保证论文比较公平，应让 MAPPO、Dijkstra 和随机基线使用相同的 YAML、时隙数、TTL、随机种子集合与指标口径。
+MAPPO 示例按多个 episode 评估，而基线 CLI 每次运行一次指定时长的仿真；正式比较时应对基线逐个运行同一组种子，再按相同统计单位聚合。
+
+另有 `scripts/check_remote_sensing_coordinates.py` 与 `scripts/check_remote_sensing_beam_model.py` 两个校验脚本，用于确认坐标框架和波束输出符合预期，改动环境建模后建议先跑一遍：
+
+```bash
+python scripts/check_remote_sensing_coordinates.py --config configs/remote_sensing_scenario.yaml
+
+# 波束校验作用在已生成的仿真输出上，--output-dir 为必填
+python scripts/check_remote_sensing_beam_model.py \
+  --output-dir outputs/remote_sensing_scenario/<run>
 ```
 
 ## 指标说明
@@ -294,22 +362,40 @@ PYTHONDONTWRITEBYTECODE=1 python -m unittest discover \
   -v
 ```
 
-测试覆盖多源任务生成、RLS 接入、CLS 路由、队列服务、随机基线、动作掩码、GAE 和 PPO 参数更新等关键逻辑。
+共 24 项测试，覆盖多源任务生成、RLS 接入、CLS 路由、下行队列服务、随机基线语义（含 Random01/02 前瞻差异）、动作掩码、GAE 和 PPO 参数更新等关键逻辑。
+
+> `src/agents/MAPPO/` 下还有 `test_remote_sensing_agent_env.py` 和 `test_vanilla_mappo.py` 两个伴随测试。上面的 `discover -s tests` 只扫描 `tests/` 目录，不会执行它们；如需一并运行，请在 `src/agents/MAPPO/` 目录下单独执行。
+
+## 常见问题排查
+
+| 现象 | 排查方向 |
+|---|---|
+| 训练一开始就报维度不匹配 | 改动环境后 Actor/Critic 输入维度需同步；确认观测 24、动作特征 18、全局状态 77 |
+| `best.pt` 没有生成 | 确认 `--eval-episodes` 大于 0、训练已运行至评估轮次；即使 `--eval-interval` 大于 `--episodes`，最后一轮仍会评估 |
+| 改了代码但训练行为不变 | 可能改到了 `src/agents/` 顶层的兼容 shim；算法实现以 `src/agents/MAPPO/` 为准 |
+| 基线成功率与预期差距很大 | 确认用的是 Random01（前瞻）还是 Random02（不前瞻），并核对 `--max-attempts` |
+| 与论文数字对不上 | 核对 YAML、时隙数、TTL、种子集合与指标口径是否完全一致；`throughput_mbps` 分母不含 drain slots |
+| 找不到输出文件 | 未传 `--output-dir` 时输出按时间戳落在 `outputs/<实验名>/<run>/` 下 |
 
 ## 早期 CQL/GraphSAGE 模块
 
 以下文件属于早期离线强化学习实验，继续保留以便追溯和对照：
 
-- `src/agents/model.py`
+- `src/agents/model.py`（GraphSAGE + SAGEConv）
 - `src/agents/cql_trainer.py`
 - `src/agents/train_offline.py`
-- `src/utils/offline_dataset.py`
+- `src/agents/geometric_model.py`、`src/agents/train_geometric.py`、`src/agents/train_supervised.py`
+- `src/data/`（TLE 下载、离线数据集采样与预计算）
+- `src/eval/dijkstra_baseline.py`、`src/eval/evaluate.py`（早期 DRL vs Dijkstra 对比）
+- `src/env/leo_routing_env.py`（早期离线 RL 环境，仅被 `src/agents/evaluate.py` 与 `src/data/` 使用）
 
 它们不是当前 RLS–CLS 多源遥感任务论文的核心算法。论文方法、实验设计和结果分析应以 `src/agents/MAPPO/` 下的共享策略 MAPPO 及对应多源环境为准。
 
+> 注意区分：`src/env/topology.py`、`link_model.py`、`queue_model.py` 虽然名字通用，但被当前主线 `remote_sensing_scenario.py` 引用，属于**在用**模块，不要当作废弃代码删除。
+
 ## 数据与训练产物
 
-仓库通过 `.gitignore` 排除本地数据集、模型权重、虚拟环境和大规模训练输出，包括 `data/`、`outputs/`、`checkpoints/`、`*.pt`、`*.pth`、`*.pkl` 等。需要共享实验结果时，建议只提交经过筛选的图表或使用独立的发布/对象存储。
+仓库通过 `.gitignore` 排除本地数据集、模型权重、虚拟环境和大规模训练输出，包括 `data/`、`outputs/`、`checkpoints/`、`venv/`、`*.pt`、`*.pth`、`*.pkl` 与 `docs/` 下的文档等。需要共享实验结果时，建议只提交经过筛选的图表或使用独立的发布/对象存储。
 
 ## 参考文献
 
