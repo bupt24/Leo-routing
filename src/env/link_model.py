@@ -14,6 +14,7 @@ EPSILON = 1e-9
 SECONDS_TO_MS = 1000.0
 SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
 SPEED_OF_LIGHT_KM_PER_MS = SPEED_OF_LIGHT_M_PER_S / 1_000_000.0
+BOLTZMANN_CONSTANT_J_PER_K = 1.380649e-23
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,11 @@ class LinkModelConfig:
     tx_power_w: float = 50.0
     rx_power_w: float = 1.0
     noise_spectral_density_w_per_hz: float = 1.0e-24
-    channel_gain_linear: float = 1.0
+    channel_gain_linear: float = 1.0  # Legacy multiplicative amplitude gain.
+    system_noise_temperature_k: float | None = None
+    tx_antenna_gain_dbi: float = 0.0
+    rx_antenna_gain_dbi: float = 0.0
+    additional_loss_db: float = 0.0
     packet_size_bits: float = 1500.0 * 8.0
 
 
@@ -40,22 +45,45 @@ def compute_fspl(distance_km: torch.Tensor, carrier_frequency_hz: float) -> torc
     return (numerator / SPEED_OF_LIGHT_M_PER_S).pow(2)
 
 
-def compute_snr(fspl: torch.Tensor, config: LinkModelConfig) -> torch.Tensor:
+def compute_snr(
+    fspl: torch.Tensor,
+    config: LinkModelConfig,
+    fading_loss_db: float | torch.Tensor = 0.0,
+) -> torch.Tensor:
+    noise_density = (
+        BOLTZMANN_CONSTANT_J_PER_K * float(config.system_noise_temperature_k)
+        if config.system_noise_temperature_k is not None
+        else float(config.noise_spectral_density_w_per_hz)
+    )
     total_noise_power = max(
-        float(config.noise_spectral_density_w_per_hz) * float(config.bandwidth_hz),
+        noise_density * float(config.bandwidth_hz),
         torch.finfo(torch.float64).tiny,
     )
-    gain_power = float(config.channel_gain_linear) ** 2 * float(config.tx_power_w)
-    return gain_power / (fspl * total_noise_power).clamp_min(torch.finfo(fspl.dtype).tiny)
+    net_gain_db = (
+        float(config.tx_antenna_gain_dbi)
+        + float(config.rx_antenna_gain_dbi)
+        - float(config.additional_loss_db)
+    )
+    gain_power = (
+        float(config.tx_power_w)
+        * float(config.channel_gain_linear) ** 2
+        * 10.0 ** (net_gain_db / 10.0)
+    )
+    snr = gain_power / (fspl * total_noise_power).clamp_min(torch.finfo(fspl.dtype).tiny)
+    if not isinstance(fading_loss_db, torch.Tensor) and float(fading_loss_db) == 0.0:
+        return snr
+    fading_db = torch.as_tensor(fading_loss_db, dtype=snr.dtype, device=snr.device)
+    return snr / torch.pow(10.0, fading_db / 10.0)
 
 
 def compute_link_rates_bps(
     distance_km: torch.Tensor,
     availability_mask: torch.Tensor,
     config: LinkModelConfig,
+    fading_loss_db: float | torch.Tensor = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     fspl = compute_fspl(distance_km, config.carrier_frequency_hz)
-    snr = compute_snr(fspl, config)
+    snr = compute_snr(fspl, config, fading_loss_db=fading_loss_db)
     rates = float(config.bandwidth_hz) * torch.log1p(snr) / math.log(2.0)
     rates = torch.where(availability_mask.bool(), rates, torch.zeros_like(rates))
     return fspl.to(torch.float32), snr.to(torch.float32), rates.to(torch.float32)

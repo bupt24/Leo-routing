@@ -21,6 +21,9 @@ def dijkstra_cls_path_to_es(
     snapshot: ScenarioSnapshot,
     start_cls_id: int,
     link_config: Any = None,
+    *,
+    min_cls_relay_hops: int = 0,
+    ttl_cap: int = 10,
 ) -> list[int]:
     """Return the minimum-delay CLS path to an exit visible in this snapshot."""
 
@@ -30,7 +33,13 @@ def dijkstra_cls_path_to_es(
         for edge in snapshot.edges
         if edge.link_type == LINK_DOWNLINK and edge.available and edge.is_data_flow_allowed
     }
-    path, _delay_ms = shortest_isl_path(snapshot, start_cls_id, exits)
+    path, _delay_ms = shortest_isl_path(
+        snapshot,
+        start_cls_id,
+        exits,
+        min_relay_hops=min_cls_relay_hops,
+        max_relay_hops=max(ttl_cap - 1, 0),
+    )
     return path
 
 

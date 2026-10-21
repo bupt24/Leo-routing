@@ -29,6 +29,7 @@ from env.remote_sensing_scenario import (  # noqa: E402
     NODE_ES,
     NODE_RLS,
     NODE_TARGET,
+    RemoteSensingScenario,
     RemoteSensingScenarioConfig,
     ScenarioEdge,
     ScenarioNode,
@@ -38,6 +39,7 @@ from env.remote_sensing_task_core import (  # noqa: E402
     DownlinkQueueManager,
     MultiSourceTaskFactory,
     RemoteSensingTask,
+    task_edge_transmission_delay_ms,
 )
 
 
@@ -236,6 +238,87 @@ class DownlinkQueueTest(unittest.TestCase):
 
 
 class RandomSemanticsTest(unittest.TestCase):
+    def test_dijkstra_requires_relay_even_when_access_cls_can_downlink(self) -> None:
+        target = node(0, "T", NODE_TARGET)
+        rls = node(1, "R", NODE_RLS)
+        access_cls = node(2, "C0", NODE_CLS, 0)
+        relay_cls = node(3, "C1", NODE_CLS, 1)
+        gs = node(4, "G", NODE_ES)
+        observation = edge(target, rls, LINK_OBSERVATION)
+        access = edge(rls, access_cls, LINK_ACCESS)
+        direct = edge(access_cls, gs, LINK_DOWNLINK)
+        relay = edge(access_cls, relay_cls, LINK_ISL)
+        relay_downlink = edge(relay_cls, gs, LINK_DOWNLINK)
+        nodes = [target, rls, access_cls, relay_cls, gs]
+        snapshot = ScenarioSnapshot(0, 0.0, nodes, [observation, access, direct, relay, relay_downlink])
+        config = replace(RemoteSensingScenarioConfig(), cls_total_sats=2, min_cls_relay_hops=1)
+        simulator = object.__new__(RandomBaselineSimulator)
+        simulator.config = config
+        simulator.scenario = RemoteSensingScenario(config)
+        simulator.scenario.node_by_id = {item.node_id: item for item in nodes}
+        simulator.random_config = RandomBaselineConfig(variant="dijkstra", ttl_cap=3)
+        item = task("t", rls, target, gs, observation, traffic_class=0, priority=0, packets=1)
+        item.candidate_access_edges = [access]
+
+        planned, reason, _, _ = simulator._plan_once(item, snapshot, [snapshot], {}, [item], random.Random(1))
+        self.assertEqual(reason, "")
+        self.assertIsNotNone(planned)
+        assert planned is not None
+        self.assertEqual(planned.node_ids[-2:], [access_cls.node_id, relay_cls.node_id])
+
+        simulator.random_config = RandomBaselineConfig(variant="dijkstra", ttl_cap=1)
+        planned, reason, _, _ = simulator._plan_once(item, snapshot, [snapshot], {}, [item], random.Random(1))
+        self.assertIsNone(planned)
+        self.assertEqual(reason, "no_path_to_gs")
+        simulator.random_config = RandomBaselineConfig(variant="dijkstra", ttl_cap=3)
+
+        no_relay_snapshot = ScenarioSnapshot(0, 0.0, nodes, [observation, access, direct])
+        planned, reason, _, _ = simulator._plan_once(
+            item, no_relay_snapshot, [no_relay_snapshot], {}, [item], random.Random(1)
+        )
+        self.assertIsNone(planned)
+        self.assertEqual(reason, "no_path_to_gs")
+
+        simulator.random_config = RandomBaselineConfig(variant="random01", ttl_cap=3)
+        random_path, reason = simulator._random_cls_path(
+            snapshot,
+            access_cls.node_id,
+            {access_cls.node_id, relay_cls.node_id},
+            random.Random(1),
+            informed=True,
+            min_relay_hops=1,
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(random_path, [access_cls.node_id, relay_cls.node_id])
+
+    def test_cls_service_rate_and_task_delay_use_consistent_units(self) -> None:
+        config = replace(RemoteSensingScenarioConfig(), cls_total_sats=1, time_slot_seconds=1.0)
+        scenario = RemoteSensingScenario(config)
+        cls = node(0, "C", NODE_CLS, 0)
+        gs = node(1, "G", NODE_ES)
+        scenario.node_by_id = {0: cls, 1: gs}
+        scenario.cls_node_ids = [0]
+        scenario.queue_lengths[0, 0] = 10.0
+        link = edge(cls, gs, LINK_DOWNLINK, delay_ms=3.0, capacity_bps=12_000.0)
+        snapshot = ScenarioSnapshot(0, 0.0, [cls, gs], [link])
+
+        scenario._service_cls_queues(snapshot)
+
+        self.assertAlmostEqual(float(scenario.cls_service_rates_pps[0].item()), 1.0)
+        self.assertAlmostEqual(float(scenario.queue_lengths[0, 0].item()), 9.0)
+
+        propagation_ms, rate_bps, _ = scenario._communication_metrics(1_000.0)
+        self.assertAlmostEqual(propagation_ms, 1_000_000.0 / 299_792.458, places=4)
+        link.delay_ms = propagation_ms
+        link.capacity_bps = rate_bps
+        item = task("t", cls, cls, gs, link, traffic_class=0, priority=0, packets=64)
+        expected = propagation_ms + 64 * scenario.link_config.packet_size_bits / rate_bps * 1_000.0
+        self.assertAlmostEqual(
+            task_edge_transmission_delay_ms(link, item, scenario.link_config.packet_size_bits),
+            expected,
+            places=4,
+        )
+
     def test_random01_looks_ahead_but_random02_can_enter_dead_end(self) -> None:
         start = node(0, "A", NODE_CLS)
         dead = node(1, "B_DEAD", NODE_CLS)
@@ -251,7 +334,7 @@ class RandomSemanticsTest(unittest.TestCase):
         informed_path, informed_reason = simulator._random_cls_path(
             snapshot, start.node_id, {exit_cls.node_id}, random.Random(1), informed=True
         )
-        simulator.random_config = RandomBaselineConfig(ttl_cap=2, variant="random02")
+        simulator.random_config = RandomBaselineConfig(ttl_cap=3, variant="random02")
 
         class FirstChoice:
             @staticmethod

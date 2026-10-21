@@ -54,6 +54,22 @@ flowchart LR
 | GS 选择权重 | 路径时延 0.35、出口可达性 0.20、可见窗口 0.20、已分配负载 0.25 |
 | 下行队列 | 3 个优先级，容量 `[20000, 50000, 100000]`，WPQ 权重 `[1.0, 1.0, 1.0]` |
 | GS 前瞻 | 20 时隙；排空阶段 20 时隙 |
+| 通信链路预算 | 30 GHz、300 MHz、50 W、系统噪声温度 500 K；接入/ISL 天线增益 25/25 dBi，下行 25/35 dBi |
+
+通信参数位于 YAML 的 `link_defaults` 和 `link_budgets`。当前数值是**可运行的工程假设，不是论文或具体终端的测量参数**。每类通信链路分别使用发射、接收天线增益和附加损耗；噪声功率谱密度由 `k_B × system_noise_temperature_k` 得到。更换论文或设备参数后，应重新运行基线并训练 MAPPO；旧输出和检查点对应旧链路预算，不应与新实验直接比较。
+
+主实验默认使用确定性自由空间信道。`channel_fading.enabled: true` 可开启用于鲁棒性实验的时间相关对数正态阴影衰落：`X_t = rho × X_(t-1) + sqrt(1-rho²) × epsilon_t`，其中 `epsilon_t ~ N(0, sigma_db²)`，有效路径损耗为原有自由空间及固定损耗再加 `X_t`。`rho` 按一个仿真时隙定义，当前配置即每 30 秒的相关系数。衰落只作用于 access、ISL、downlink 和 RLS backup 通信边，不改变轨道、几何可见性、观测波束或任务生成。
+
+```yaml
+channel_fading:
+  enabled: false
+  model: correlated_lognormal
+  seed: 2026
+  sigma_db: 2.0
+  rho: 0.95
+```
+
+每条物理链路使用由 `channel_fading.seed` 派生的独立随机流；ISL 和 RLS backup 的正反向边共享同一状态。环境也支持 `reset(channel_seed=...)` 覆盖本轮信道种子。启用衰落后应重新训练模型，并在实验记录中保存信道种子。
 
 默认生成三类异构任务：
 
@@ -94,6 +110,8 @@ flowchart LR
 3. 达到最小中继跳数且预测存在目标 ES 下行机会时，可选择 `egress`。
 4. 数据进入出口 CLS 的分类下行队列；调度器先服务最高优先级业务，再在同优先级的可服务队列之间按 WPQ 权重分配服务时间。
 5. 任务在截止期内完成下传则成功，否则按超时、TTL、队列竞争或溢出等原因失败。
+
+通信边的 `delay_ms` 只记录传播时延；接入与 ISL 路由按任务大小另计传输时延。当前接入和 ISL 在生成任务的拓扑快照中一次性规划，未对跨时隙的部分传输和链路可见性变化做逐时隙调度；下行队列按时隙分批服务。CLS 队列服务率使用包/秒。
 
 ### 奖励设计
 
@@ -145,6 +163,7 @@ Leo-routing/
 │   │   ├── aqm_wpq.py                     # AQM 与 WPQ 队列逻辑
 │   │   ├── topology.py                    # Walker 星座拓扑构建（被主线引用）
 │   │   ├── link_model.py                  # 链路时延/能耗模型（被主线引用）
+│   │   ├── channel_fading.py              # 可选时间相关阴影衰落
 │   │   ├── queue_model.py                 # 队列时延模型（被主线引用）
 │   │   ├── 0{1,2,3,4}remote_sensing_random_baseline.py  # 变体薄封装
 │   │   └── leo_routing_env.py             # 早期离线 RL 环境
@@ -289,7 +308,7 @@ python scripts/plot/run_mappo_training_curves.py \
 
 | 变体 | 入口 | 路由行为 |
 |---|---|---|
-| Dijkstra | `scripts/run_remote_sensing_dijkstra.py` | 按链路代价求最短路径 |
+| Dijkstra | `scripts/run_remote_sensing_dijkstra.py` | 按任务传输时延求最短路径，遵守最小 CLS 中继跳数和 TTL |
 | Random01 | `scripts/run_remote_sensing_random_baseline.py`<br>`scripts/01run_remote_sensing_random_baseline.py` | 随机路由，带前瞻（不主动走进死胡同） |
 | Random02 | `scripts/02run_remote_sensing_random_baseline.py` | 随机路由，无前瞻，可能进入死胡同后失败 |
 | Random03 | `scripts/03run_remote_sensing_random_baseline.py` | 在随机接入基础上允许重试，累计失败尝试的时延与能耗 |

@@ -174,7 +174,10 @@ def build_route_metric_record(
     return {
         "delay_ms_total": path_delay_ms(all_edges, scenario.link_config),
         "delay_ms_cls_route": path_delay_ms(cls_edges, scenario.link_config),
-        "energy_j_total": path_energy_j(all_edges, scenario.config, scenario.link_config),
+        "energy_j_total": sum(
+            task_total_edge_energy_j(edge, scenario.config, scenario.link_config_for(edge.link_type))
+            for edge in all_edges
+        ),
         "loss_total": path_loss(all_edges),
     }
 

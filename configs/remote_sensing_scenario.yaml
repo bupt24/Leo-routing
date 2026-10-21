@@ -100,6 +100,40 @@ allow_es_to_any: false
 min_elevation_deg: 10.0
 
 # -------------------------
+# Communication link budgets (engineering example, not measured hardware)
+# Noise density is k_B * system_noise_temperature_k.
+# Replace these assumptions with the paper or terminal specifications.
+# -------------------------
+link_defaults:
+  carrier_frequency_hz: 30.0e9
+  bandwidth_hz: 300.0e6
+  tx_power_w: 50.0
+  rx_power_w: 1.0
+  system_noise_temperature_k: 500.0
+  additional_loss_db: 3.0
+  packet_size_bits: 12000.0
+link_budgets:
+  - link_type: access
+    tx_antenna_gain_dbi: 25.0
+    rx_antenna_gain_dbi: 25.0
+  - link_type: isl
+    tx_antenna_gain_dbi: 25.0
+    rx_antenna_gain_dbi: 25.0
+  - link_type: downlink
+    tx_antenna_gain_dbi: 25.0
+    rx_antenna_gain_dbi: 35.0
+    additional_loss_db: 5.0
+
+# Optional robustness experiment. The main experiment remains deterministic.
+# rho is the correlation between adjacent 30-second simulation slots.
+channel_fading:
+  enabled: false
+  model: correlated_lognormal
+  seed: 2026
+  sigma_db: 2.0
+  rho: 0.95
+
+# -------------------------
 # RLS observation beam model
 # -------------------------
 beam:
@@ -133,7 +167,7 @@ rls_access_policy: best_quality
 # -------------------------
 # Packet and queue settings
 # -------------------------
-packet_count_per_task: 64.0 # compatibility only; multi-source tasks use task_profiles
+packet_count_per_task: 64.0 # legacy edge-energy proxy; multi-source delay uses task_profiles
 packet_class: 0 # compatibility only
 num_traffic_classes: 3
 queue_capacities: [20000, 50000, 100000]

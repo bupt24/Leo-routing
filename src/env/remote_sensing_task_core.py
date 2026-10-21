@@ -7,8 +7,11 @@ from dataclasses import dataclass, field
 import heapq
 import math
 import random
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+import torch
+
+from env.link_model import compute_link_rates_bps
 from env.remote_sensing_scenario import (
     LINK_ACCESS,
     LINK_DOWNLINK,
@@ -77,7 +80,7 @@ class DownlinkQueueItem:
 
 def task_edge_transmission_delay_ms(edge: ScenarioEdge, task: RemoteSensingTask, packet_size_bits: float) -> float:
     if edge.capacity_bps <= 0.0:
-        return float(edge.delay_ms)
+        return float("inf") if task.packet_count > 0.0 else float(edge.delay_ms)
     transmission_ms = task.packet_count * float(packet_size_bits) / float(edge.capacity_bps) * 1000.0
     propagation_ms = max(float(edge.delay_ms), 0.0)
     return propagation_ms + transmission_ms
@@ -104,10 +107,68 @@ def shortest_isl_path(
     exit_cls_ids: set[int],
     *,
     blocked: set[int] | None = None,
+    min_relay_hops: int = 0,
+    max_relay_hops: int | None = None,
+    edge_cost: Callable[[ScenarioEdge], float] | None = None,
 ) -> tuple[list[int], float]:
+    min_relay_hops = max(int(min_relay_hops), 0)
+    blocked = set(blocked or ())
+    if max_relay_hops is not None and max_relay_hops < min_relay_hops:
+        return [], float("inf")
+
+    def cost_of(edge: ScenarioEdge) -> float:
+        return max(float(edge_cost(edge) if edge_cost is not None else edge.delay_ms), 0.0)
+
+    # For the configured one-relay case, a bounded shortest-path search avoids
+    # enumerating every simple path through the CLS constellation. A cheaper
+    # prefix with the same node and hop count dominates a more expensive one.
+    if min_relay_hops <= 1 and (min_relay_hops or max_relay_hops is not None):
+        node_limit = sum(node.node_type == NODE_CLS for node in snapshot.nodes) - 1
+        hop_limit = node_limit if max_relay_hops is None else min(max_relay_hops, node_limit)
+        heap: list[tuple[float, tuple[int, ...]]] = [(0.0, (start_cls_id,))]
+        best_by_state: dict[tuple[int, int], float] = {(start_cls_id, 0): 0.0}
+        while heap:
+            distance, path = heapq.heappop(heap)
+            current = path[-1]
+            hops = len(path) - 1
+            if distance > best_by_state.get((current, hops), float("inf")):
+                continue
+            if current in exit_cls_ids and hops >= min_relay_hops:
+                return list(path), distance
+            if hops >= hop_limit:
+                continue
+            for edge in current_isl_edges(snapshot, current):
+                if edge.dst_id in blocked or edge.dst_id in path:
+                    continue
+                candidate = distance + cost_of(edge)
+                state = (edge.dst_id, hops + 1)
+                if math.isfinite(candidate) and candidate < best_by_state.get(state, float("inf")):
+                    best_by_state[state] = candidate
+                    heapq.heappush(heap, (candidate, path + (edge.dst_id,)))
+        return [], float("inf")
+
+    # Higher relay minima still use exact simple-path enumeration. MAPPO masks
+    # visited CLS nodes, so cycling back to the starting exit is not legal.
+    if min_relay_hops:
+        heap: list[tuple[float, tuple[int, ...]]] = [(0.0, (start_cls_id,))]
+        while heap:
+            distance, path = heapq.heappop(heap)
+            current = path[-1]
+            hops = len(path) - 1
+            if current in exit_cls_ids and hops >= min_relay_hops:
+                return list(path), distance
+            if max_relay_hops is not None and hops >= max_relay_hops:
+                continue
+            for edge in current_isl_edges(snapshot, current):
+                if edge.dst_id in blocked or edge.dst_id in path:
+                    continue
+                edge_delay = cost_of(edge)
+                if math.isfinite(edge_delay):
+                    heapq.heappush(heap, (distance + edge_delay, path + (edge.dst_id,)))
+        return [], float("inf")
+
     if start_cls_id in exit_cls_ids:
         return [start_cls_id], 0.0
-    blocked = set(blocked or ())
     distances: dict[int, float] = {start_cls_id: 0.0}
     previous: dict[int, int] = {}
     heap: list[tuple[float, int]] = [(0.0, start_cls_id)]
@@ -120,9 +181,9 @@ def shortest_isl_path(
             reached = node_id
             break
         for edge in current_isl_edges(snapshot, node_id):
-            if edge.dst_id in blocked and edge.dst_id not in exit_cls_ids:
+            if edge.dst_id in blocked:
                 continue
-            candidate = distance + max(float(edge.delay_ms), 0.0)
+            candidate = distance + cost_of(edge)
             if candidate < distances.get(edge.dst_id, float("inf")):
                 distances[edge.dst_id] = candidate
                 previous[edge.dst_id] = node_id
@@ -273,6 +334,31 @@ class MultiSourceTaskFactory:
                 return profile
         return self.config.task_profiles[-1]
 
+    def _nominal_capacity_bps(self, edge: ScenarioEdge) -> float:
+        if edge.link_type == LINK_DOWNLINK:
+            link_config = self.config.link_budgets.downlink
+        elif edge.link_type == LINK_ISL:
+            link_config = self.config.link_budgets.isl
+        else:
+            link_config = self.config.link_budgets.access
+        _, _, rate_bps = compute_link_rates_bps(
+            torch.tensor(edge.distance_km, dtype=torch.float32),
+            torch.tensor(True),
+            link_config,
+        )
+        return float(rate_bps.item())
+
+    def _nominal_task_edge_delay_ms(
+        self,
+        edge: ScenarioEdge,
+        task: RemoteSensingTask,
+    ) -> float:
+        capacity_bps = self._nominal_capacity_bps(edge)
+        if capacity_bps <= 0.0:
+            return float("inf") if task.packet_count > 0.0 else float(edge.delay_ms)
+        transmission_ms = task.packet_count * self.packet_size_bits / capacity_bps * 1000.0
+        return max(float(edge.delay_ms), 0.0) + transmission_ms
+
     def _select_gs(
         self,
         task: RemoteSensingTask,
@@ -295,19 +381,29 @@ class MultiSourceTaskFactory:
             reachable = 0
             path_delays: list[float] = []
             for access in task.candidate_access_edges:
-                path, delay = shortest_isl_path(snapshot, access.dst_id, exit_ids)
+                path, delay = shortest_isl_path(
+                    snapshot,
+                    access.dst_id,
+                    exit_ids,
+                    min_relay_hops=self.config.min_cls_relay_hops,
+                    edge_cost=lambda edge: self._nominal_task_edge_delay_ms(edge, task),
+                )
                 if path:
                     reachable += 1
-                    path_delays.append(float(access.delay_ms) + delay)
+                    path_delays.append(
+                        self._nominal_task_edge_delay_ms(access, task) + delay
+                    )
             if reachable == 0:
                 continue
             first_slot = min(offset for offset, _edge in contacts)
             visible_slots = len({offset for offset, _edge in contacts})
             service_packets = sum(
-                float(edge.capacity_bps) * float(self.config.time_slot_seconds) / self.packet_size_bits
+                self._nominal_capacity_bps(edge)
+                * float(self.config.time_slot_seconds)
+                / self.packet_size_bits
                 for _offset, edge in contacts
             )
-            delay_norm = min(min(path_delays) / max(self.config.normalizer_delay_ms, 1.0), 1.0)
+            delay_norm = min(min(path_delays) / max(task.deadline_s * 1000.0, 1.0), 1.0)
             reachability_penalty = 1.0 - reachable / max(len(task.candidate_access_edges), 1)
             window_penalty = 0.5 * min(first_slot / horizon, 1.0) + 0.5 * (1.0 - visible_slots / horizon)
             assigned = queued.get(gs.node_id, 0.0) + reservations.get(gs.node_id, 0.0) + task.packet_count
@@ -353,7 +449,12 @@ class MultiSourceTaskFactory:
         future_snapshots: list[ScenarioSnapshot],
     ) -> bool:
         exit_ids = {edge.src_id for _offset, edge in self._contacts_for_gs(gs_id, future_snapshots)}
-        path, _delay = shortest_isl_path(snapshot, access_cls_id, exit_ids)
+        path, _delay = shortest_isl_path(
+            snapshot,
+            access_cls_id,
+            exit_ids,
+            min_relay_hops=self.config.min_cls_relay_hops,
+        )
         return bool(path)
 
     def exit_forecast(

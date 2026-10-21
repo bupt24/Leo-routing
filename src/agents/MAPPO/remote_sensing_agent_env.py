@@ -67,6 +67,7 @@ class CachedSlot:
 class RemoteSensingEnvCache:
     slot_offset: int
     slots: list[CachedSlot]
+    channel_seed: int = 2026
 
     @classmethod
     def build(
@@ -75,14 +76,22 @@ class RemoteSensingEnvCache:
         *,
         time_slots: int,
         slot_offset: int = 0,
+        channel_seed: int | None = None,
     ) -> "RemoteSensingEnvCache":
-        scenario = RemoteSensingScenario(config)
+        effective_channel_seed = int(
+            config.channel_fading.seed if channel_seed is None else channel_seed
+        )
+        scenario = RemoteSensingScenario(config, channel_seed=effective_channel_seed)
         total = max(1, int(time_slots)) + int(config.drain_slots) + int(config.gs_lookahead_slots)
         slots = [
             CachedSlot(scenario.build_snapshot(int(slot_offset) + index))
             for index in range(total)
         ]
-        return cls(slot_offset=int(slot_offset), slots=slots)
+        return cls(
+            slot_offset=int(slot_offset),
+            channel_seed=effective_channel_seed,
+            slots=slots,
+        )
 
     def slot(self, relative_slot: int) -> CachedSlot:
         return self.slots[int(relative_slot)]
@@ -127,6 +136,7 @@ class RemoteSensingAgentEnv:
         self.downlink = DownlinkQueueManager(config, self.scenario.link_config.packet_size_bits)
         self.episode = 0
         self.seed = 0
+        self.channel_seed = int(config.channel_fading.seed)
         self.slot_offset = 0
         self.current_slot = 0
         self.done = False
@@ -150,13 +160,20 @@ class RemoteSensingAgentEnv:
         episode: int = 0,
         seed: int = 0,
         slot_offset: int = 0,
+        channel_seed: int | None = None,
     ) -> dict[str, dict[str, torch.Tensor]] | None:
         self.episode = int(episode)
         self.seed = int(seed)
+        self.channel_seed = int(
+            self.config.channel_fading.seed if channel_seed is None else channel_seed
+        )
         self.slot_offset = int(slot_offset)
         self.current_slot = 0
         self.done = False
-        self.scenario = RemoteSensingScenario(self.config)
+        self.scenario = RemoteSensingScenario(
+            self.config,
+            channel_seed=self.channel_seed,
+        )
         self.task_factory = MultiSourceTaskFactory(self.config, self.scenario.link_config.packet_size_bits)
         self.downlink = DownlinkQueueManager(self.config, self.scenario.link_config.packet_size_bits)
         self.snapshot = None
@@ -177,10 +194,16 @@ class RemoteSensingAgentEnv:
                 raise ValueError(
                     f"Cache slot_offset={self.cache.slot_offset} does not match requested {self.slot_offset}."
                 )
-            if len(self.cache.slots) < total:
-                raise ValueError("RemoteSensingEnvCache does not cover the episode and GS lookahead horizon.")
-            return [self.cache.slot(index).snapshot for index in range(total)]
-        forecaster = RemoteSensingScenario(self.config)
+            if self.cache.channel_seed == self.channel_seed:
+                if len(self.cache.slots) < total:
+                    raise ValueError(
+                        "RemoteSensingEnvCache does not cover the episode and GS lookahead horizon."
+                    )
+                return [self.cache.slot(index).snapshot for index in range(total)]
+        forecaster = RemoteSensingScenario(
+            self.config,
+            channel_seed=self.channel_seed,
+        )
         return [forecaster.build_snapshot(self.slot_offset + index) for index in range(total)]
 
     def _activate_snapshot(self, relative_slot: int) -> ScenarioSnapshot:
@@ -420,7 +443,19 @@ class RemoteSensingAgentEnv:
                 and edge.dst_id == task.destination_gs.node_id
                 and edge.dst_type == NODE_ES
             }
-            path, path_delay = shortest_isl_path(route.snapshot, candidate.dst_id, exit_ids)
+            remaining_relays = max(
+                int(self.config.min_cls_relay_hops)
+                - len(route.cls_edges)
+                - (1 if candidate.kind == "isl" else 0),
+                0,
+            )
+            path, path_delay = shortest_isl_path(
+                route.snapshot,
+                candidate.dst_id,
+                exit_ids,
+                blocked=route.visited_cls_ids,
+                min_relay_hops=remaining_relays,
+            )
             reachable = 1.0 if path else 0.0
             wait = 0.0
             service = 0.0 if not path else 1.0 / (1.0 + path_delay)
@@ -784,8 +819,9 @@ class RemoteSensingAgentEnv:
     def _task_edge_energy(self, edge: ScenarioEdge | None, task: RemoteSensingTask) -> float:
         if edge is None or edge.capacity_bps <= 0.0:
             return 0.0
-        duration_s = task.packet_count * self.scenario.link_config.packet_size_bits / float(edge.capacity_bps)
-        return (self.scenario.link_config.tx_power_w + self.scenario.link_config.rx_power_w) * duration_s
+        link_config = self.scenario.link_config_for(edge.link_type)
+        duration_s = task.packet_count * link_config.packet_size_bits / float(edge.capacity_bps)
+        return (link_config.tx_power_w + link_config.rx_power_w) * duration_s
 
     def episode_summary(self) -> dict[str, Any]:
         success = [route for route in self.routes if route["success"]]

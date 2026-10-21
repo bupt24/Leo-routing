@@ -19,7 +19,7 @@ from datetime import datetime
 import heapq
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,11 @@ import torch
 
 from env.aqm_wpq import allocate_wpq_service, compute_aqm_drop_probabilities
 from env.beam_model import BeamConfig, BeamResult, compute_rls_beam_to_target
+from env.channel_fading import (
+    ChannelFadingConfig,
+    CorrelatedLognormalFading,
+    make_channel_link_key,
+)
 from env.coordinate_utils import (
     eci_to_ecef,
     latlon_to_ecef_km,
@@ -37,7 +42,6 @@ from env.link_model import (
     compute_link_rates_bps,
     compute_propagation_delay_ms,
     compute_reception_energy_j,
-    compute_transmission_delay_ms,
     compute_transmission_energy_j,
 )
 from env.queue_model import (
@@ -136,6 +140,13 @@ DEFAULT_TASK_PROFILES = (
 
 
 @dataclass(frozen=True)
+class ScenarioLinkBudgets:
+    access: LinkModelConfig = field(default_factory=LinkModelConfig)
+    isl: LinkModelConfig = field(default_factory=LinkModelConfig)
+    downlink: LinkModelConfig = field(default_factory=LinkModelConfig)
+
+
+@dataclass(frozen=True)
 class RemoteSensingScenarioConfig:
     time_slot_seconds: float = 1.0
     num_targets: int = 3
@@ -174,6 +185,8 @@ class RemoteSensingScenarioConfig:
 
     min_elevation_deg: float = 10.0
     beam: BeamConfig = field(default_factory=BeamConfig)
+    link_budgets: ScenarioLinkBudgets = field(default_factory=ScenarioLinkBudgets)
+    channel_fading: ChannelFadingConfig = field(default_factory=ChannelFadingConfig)
     max_rls_isl_distance_km: float = 12_000.0
     max_cls_isl_distance_km: float = 16_000.0
     max_cross_layer_distance_km: float = 20_000.0
@@ -515,6 +528,68 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
         return _load_simple_yaml(config_path)
 
 
+def _link_model_from_mapping(raw: dict[str, Any], base: LinkModelConfig) -> LinkModelConfig:
+    allowed = {item.name for item in fields(LinkModelConfig)}
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"Unknown link budget fields: {sorted(unknown)}.")
+    values = {name: getattr(base, name) for name in allowed}
+    for name, value in raw.items():
+        values[name] = None if name == "system_noise_temperature_k" and value is None else float(value)
+    return LinkModelConfig(**values)
+
+
+def _parse_link_budgets(raw: dict[str, Any]) -> ScenarioLinkBudgets:
+    defaults_raw = raw.get("link_defaults") or {}
+    if not isinstance(defaults_raw, dict):
+        raise ValueError("link_defaults must be a mapping.")
+    defaults = _link_model_from_mapping(defaults_raw, LinkModelConfig())
+    budgets = {name: defaults for name in (LINK_ACCESS, LINK_ISL, LINK_DOWNLINK)}
+    rows = raw.get("link_budgets") or []
+    if not isinstance(rows, list):
+        raise ValueError("link_budgets must be a list of mappings.")
+    seen: set[str] = set()
+    for index, item in enumerate(rows):
+        if not isinstance(item, dict):
+            raise ValueError(f"link_budgets[{index}] must be a mapping.")
+        link_type = str(item.get("link_type", ""))
+        if link_type not in budgets or link_type in seen:
+            raise ValueError(f"Invalid or duplicate link_budgets link_type={link_type!r}.")
+        seen.add(link_type)
+        budgets[link_type] = _link_model_from_mapping(
+            {key: value for key, value in item.items() if key != "link_type"}, defaults
+        )
+    return ScenarioLinkBudgets(
+        access=budgets[LINK_ACCESS],
+        isl=budgets[LINK_ISL],
+        downlink=budgets[LINK_DOWNLINK],
+    )
+
+
+def _parse_channel_fading(raw: dict[str, Any]) -> ChannelFadingConfig:
+    fading_raw = raw.get("channel_fading") or {}
+    if not isinstance(fading_raw, dict):
+        raise ValueError("channel_fading must be a mapping.")
+    allowed = {item.name for item in fields(ChannelFadingConfig)}
+    unknown = set(fading_raw) - allowed
+    if unknown:
+        raise ValueError(f"Unknown channel_fading fields: {sorted(unknown)}.")
+
+    enabled = fading_raw.get("enabled", False)
+    seed = fading_raw.get("seed", 2026)
+    if not isinstance(enabled, bool):
+        raise ValueError("channel_fading.enabled must be a boolean.")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("channel_fading.seed must be an integer.")
+    return ChannelFadingConfig(
+        enabled=enabled,
+        model=str(fading_raw.get("model", "correlated_lognormal")),
+        seed=seed,
+        sigma_db=float(fading_raw.get("sigma_db", 2.0)),
+        rho=float(fading_raw.get("rho", 0.95)),
+    )
+
+
 def scenario_config_from_dict(raw: dict[str, Any]) -> RemoteSensingScenarioConfig:
     target_items = raw.get("targets") or []
     targets: list[GroundPoint] = []
@@ -622,6 +697,8 @@ def scenario_config_from_dict(raw: dict[str, Any]) -> RemoteSensingScenarioConfi
         routing_weights=weights,
         min_elevation_deg=float(raw.get("min_elevation_deg", 10.0)),
         beam=beam,
+        link_budgets=_parse_link_budgets(raw),
+        channel_fading=_parse_channel_fading(raw),
         max_rls_isl_distance_km=float(raw.get("max_rls_isl_distance_km", 12_000.0)),
         max_cls_isl_distance_km=float(raw.get("max_cls_isl_distance_km", 16_000.0)),
         max_cross_layer_distance_km=float(raw.get("max_cross_layer_distance_km", 20_000.0)),
@@ -664,6 +741,43 @@ def load_scenario_config(path: str | Path) -> RemoteSensingScenarioConfig:
 
 
 def _validate_config(cfg: RemoteSensingScenarioConfig) -> None:
+    fading = cfg.channel_fading
+    if fading.model != "correlated_lognormal":
+        raise ValueError(
+            "channel_fading.model must be 'correlated_lognormal'."
+        )
+    if not math.isfinite(fading.sigma_db) or fading.sigma_db < 0.0:
+        raise ValueError("channel_fading.sigma_db must be finite and non-negative.")
+    if not math.isfinite(fading.rho) or not 0.0 <= fading.rho < 1.0:
+        raise ValueError("channel_fading.rho must be finite and in [0, 1).")
+    packet_sizes = set()
+    for name in (LINK_ACCESS, LINK_ISL, LINK_DOWNLINK):
+        budget = getattr(cfg.link_budgets, name)
+        for value_name in (
+            "carrier_frequency_hz",
+            "bandwidth_hz",
+            "tx_power_w",
+            "rx_power_w",
+            "noise_spectral_density_w_per_hz",
+            "channel_gain_linear",
+            "packet_size_bits",
+        ):
+            value = float(getattr(budget, value_name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name}.{value_name} must be finite and positive.")
+        if budget.system_noise_temperature_k is not None and (
+            not math.isfinite(budget.system_noise_temperature_k)
+            or budget.system_noise_temperature_k <= 0.0
+        ):
+            raise ValueError(f"{name}.system_noise_temperature_k must be finite and positive.")
+        for value_name in ("tx_antenna_gain_dbi", "rx_antenna_gain_dbi", "additional_loss_db"):
+            if not math.isfinite(float(getattr(budget, value_name))):
+                raise ValueError(f"{name}.{value_name} must be finite.")
+        if budget.additional_loss_db < 0.0:
+            raise ValueError(f"{name}.additional_loss_db must be non-negative.")
+        packet_sizes.add(budget.packet_size_bits)
+    if len(packet_sizes) != 1:
+        raise ValueError("All communication link budgets must use the same packet_size_bits.")
     if cfg.rls_num_planes * cfg.rls_sats_per_plane != cfg.rls_total_sats:
         raise ValueError("RLS plane/satellite counts must multiply to rls_total_sats.")
     if cfg.cls_num_planes * cfg.cls_sats_per_plane != cfg.cls_total_sats:
@@ -753,9 +867,21 @@ def _validate_config(cfg: RemoteSensingScenarioConfig) -> None:
 
 
 class RemoteSensingScenario:
-    def __init__(self, config: RemoteSensingScenarioConfig):
+    def __init__(
+        self,
+        config: RemoteSensingScenarioConfig,
+        *,
+        channel_seed: int | None = None,
+    ):
         self.config = config
-        self.link_config = LinkModelConfig()
+        self.channel_seed = int(
+            config.channel_fading.seed if channel_seed is None else channel_seed
+        )
+        self.channel_fading = CorrelatedLognormalFading(
+            config.channel_fading,
+            seed=self.channel_seed,
+        )
+        self.link_config = config.link_budgets.access  # Shared packet size and compatibility alias.
         self.device = torch.device("cpu")
         self.queue_capacities = torch.tensor(config.queue_capacities, dtype=torch.float32)
         self.priority_levels = torch.tensor(config.priority_levels, dtype=torch.float32)
@@ -771,6 +897,13 @@ class RemoteSensingScenario:
         self.cls_loss_risk: dict[int, float] = {}
         self.cls_queue_length: dict[int, float] = {}
         self.cls_service_rates_pps = torch.zeros(config.cls_total_sats, dtype=torch.float32)
+
+    def link_config_for(self, link_type: str) -> LinkModelConfig:
+        if link_type == LINK_DOWNLINK:
+            return self.config.link_budgets.downlink
+        if link_type in {LINK_ISL, LINK_RLS_BACKUP}:
+            return self.config.link_budgets.isl
+        return self.config.link_budgets.access
 
     def run(
         self,
@@ -840,6 +973,7 @@ class RemoteSensingScenario:
         edges.extend(self._build_cls_isl_edges(time_slot, nodes))
         edges.extend(self._build_downlink_edges(time_slot, nodes))
 
+        self._apply_channel_fading(edges)
         self._refresh_cls_queue_metrics(edges)
         for edge in edges:
             owner = self._edge_queue_owner(edge)
@@ -1110,7 +1244,7 @@ class RemoteSensingScenario:
             capacity_bps = 0.0
             energy_cost = beam_result.observation_energy_j
         elif communication_metric:
-            delay_ms, capacity_bps, energy_cost = self._communication_metrics(distance_km)
+            delay_ms, capacity_bps, energy_cost = self._communication_metrics(distance_km, link_type)
         else:
             delay_ms = 0.0
             capacity_bps = 0.0
@@ -1141,28 +1275,65 @@ class RemoteSensingScenario:
             beam_reason=beam_result.reason if beam_result is not None else "",
         )
 
-    def _communication_metrics(self, distance_km: float) -> tuple[float, float, float]:
+    def _communication_metrics(
+        self,
+        distance_km: float,
+        link_type: str = LINK_ACCESS,
+        fading_loss_db: float = 0.0,
+    ) -> tuple[float, float, float]:
+        link_config = self.link_config_for(link_type)
         distance = torch.tensor(distance_km, dtype=torch.float32)
         available = torch.tensor(True)
-        _, _, rate_bps = compute_link_rates_bps(distance, available, self.link_config)
-        prop_delay_ms = compute_propagation_delay_ms(distance, available)
-        tx_delay_ms = compute_transmission_delay_ms(
-            torch.tensor(self.config.packet_count_per_task, dtype=torch.float32),
-            rate_bps,
-            self.link_config.packet_size_bits,
+        _, _, rate_bps = compute_link_rates_bps(
+            distance,
+            available,
+            link_config,
+            fading_loss_db=fading_loss_db,
         )
+        prop_delay_ms = compute_propagation_delay_ms(distance, available)
+        # Edge delay is propagation only. Task serialization depends on the
+        # generated task size and is added by task_edge_transmission_delay_ms.
         tx_energy, duration_s = compute_transmission_energy_j(
             torch.tensor(self.config.packet_count_per_task, dtype=torch.float32),
             rate_bps,
             available,
-            self.link_config,
+            link_config,
         )
-        rx_energy = compute_reception_energy_j(duration_s, available, self.link_config)
+        rx_energy = compute_reception_energy_j(duration_s, available, link_config)
         return (
-            float((prop_delay_ms + tx_delay_ms).item()),
+            float(prop_delay_ms.item()),
             float(rate_bps.item()),
             float((tx_energy + rx_energy).item()),
         )
+
+    def _apply_channel_fading(self, edges: list[ScenarioEdge]) -> None:
+        if not self.config.channel_fading.enabled:
+            return
+        communication_types = {
+            LINK_ACCESS,
+            LINK_ISL,
+            LINK_DOWNLINK,
+            LINK_RLS_BACKUP,
+        }
+        for edge in edges:
+            if edge.link_type not in communication_types:
+                continue
+            src = self.node_by_id[edge.src_id]
+            dst = self.node_by_id[edge.dst_id]
+            link_key = make_channel_link_key(
+                edge.link_type,
+                (src.node_type, src.local_id),
+                (dst.node_type, dst.local_id),
+                undirected=edge.link_type in {LINK_ISL, LINK_RLS_BACKUP},
+            )
+            fading_loss_db = self.channel_fading.loss_db(link_key, edge.time_slot)
+            edge.delay_ms, edge.capacity_bps, edge.energy_cost = (
+                self._communication_metrics(
+                    edge.distance_km,
+                    edge.link_type,
+                    fading_loss_db=fading_loss_db,
+                )
+            )
 
     def _space_link_available(self, src: ScenarioNode, dst: ScenarioNode, max_distance_km: float) -> bool:
         distance = float(torch.norm(src.position_km - dst.position_km).item())
@@ -1185,9 +1356,10 @@ class RemoteSensingScenario:
             if edge.src_type == NODE_CLS and edge.is_data_flow_allowed:
                 cls_idx = self.node_by_id[edge.src_id].local_id
                 rates[cls_idx] += float(edge.capacity_bps)
+        rates_pps = rates / float(self.link_config.packet_size_bits)
 
         service_by_class, active_mask = allocate_wpq_service(
-            rates,
+            rates_pps,
             self.queue_lengths,
             self.priority_levels,
             self.default_wpq_weights,
@@ -1206,7 +1378,7 @@ class RemoteSensingScenario:
             self.default_aqm[:, 2],
         )
 
-        self.cls_service_rates_pps = rates
+        self.cls_service_rates_pps = rates_pps
         self.cls_queue_delay_ms = {}
         self.cls_queue_length = {}
         self.cls_loss_risk = {}

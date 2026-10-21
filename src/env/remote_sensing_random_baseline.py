@@ -79,8 +79,9 @@ class PlannedRoute:
 def _task_edge_energy(edge: ScenarioEdge, task: RemoteSensingTask, scenario: RemoteSensingScenario) -> float:
     if edge.capacity_bps <= 0.0:
         return 0.0
-    duration_s = task.packet_count * scenario.link_config.packet_size_bits / float(edge.capacity_bps)
-    return (scenario.link_config.tx_power_w + scenario.link_config.rx_power_w) * duration_s
+    link_config = scenario.link_config_for(edge.link_type)
+    duration_s = task.packet_count * link_config.packet_size_bits / float(edge.capacity_bps)
+    return (link_config.tx_power_w + link_config.rx_power_w) * duration_s
 
 
 def _future_exit_ids(task: RemoteSensingTask, future: list[ScenarioSnapshot]) -> set[int]:
@@ -97,20 +98,25 @@ def _future_exit_ids(task: RemoteSensingTask, future: list[ScenarioSnapshot]) ->
     }
 
 
-def _shortest_hops(snapshot: ScenarioSnapshot, start: int, exits: set[int], blocked: set[int]) -> int | None:
-    if start in exits:
-        return 0
-    frontier = [(start, 0)]
-    visited = set(blocked) | {start}
-    for node_id, hops in frontier:
-        for edge in current_isl_edges(snapshot, node_id):
-            if edge.dst_id in exits:
-                return hops + 1
-            if edge.dst_id in visited:
-                continue
-            visited.add(edge.dst_id)
-            frontier.append((edge.dst_id, hops + 1))
-    return None
+def _shortest_hops(
+    snapshot: ScenarioSnapshot,
+    start: int,
+    exits: set[int],
+    blocked: set[int],
+    *,
+    min_relay_hops: int = 0,
+    max_relay_hops: int | None = None,
+) -> int | None:
+    path, _ = shortest_isl_path(
+        snapshot,
+        start,
+        exits,
+        blocked=blocked,
+        min_relay_hops=min_relay_hops,
+        max_relay_hops=max_relay_hops,
+        edge_cost=lambda _edge: 1.0,
+    )
+    return len(path) - 1 if path else None
 
 
 class RandomBaselineSimulator:
@@ -313,7 +319,14 @@ class RandomBaselineSimulator:
             joint_candidates: list[tuple[float, str, ScenarioEdge, list[int], float]] = []
             for candidate_access in access_edges:
                 candidate_path, _path_weight = shortest_isl_path(
-                    snapshot, candidate_access.dst_id, exits
+                    snapshot,
+                    candidate_access.dst_id,
+                    exits,
+                    min_relay_hops=self.config.min_cls_relay_hops,
+                    max_relay_hops=max(self.random_config.ttl_cap - 1, 0),
+                    edge_cost=lambda edge: task_edge_transmission_delay_ms(
+                        edge, task, self.scenario.link_config.packet_size_bits
+                    ),
                 )
                 if not candidate_path:
                     continue
@@ -355,6 +368,7 @@ class RandomBaselineSimulator:
                 exits,
                 rng,
                 informed=self.random_config.variant == "random01",
+                min_relay_hops=self.config.min_cls_relay_hops,
             )
             partial_edges = [task.observation_edge, access]
             partial_edges.extend(self._resolve_cls_edges(snapshot, cls_path))
@@ -417,32 +431,47 @@ class RandomBaselineSimulator:
         rng: random.Random,
         *,
         informed: bool,
+        min_relay_hops: int = 0,
     ) -> tuple[list[int], str]:
+        max_hops = max(self.random_config.ttl_cap - 1, 0)
         if informed:
-            shortest = _shortest_hops(snapshot, start_cls_id, exits, set())
+            shortest = _shortest_hops(
+                snapshot,
+                start_cls_id,
+                exits,
+                set(),
+                min_relay_hops=min_relay_hops,
+                max_relay_hops=max_hops,
+            )
             if shortest is None:
                 return [start_cls_id], "no_path_to_gs"
-            ttl = min(self.random_config.ttl_cap, shortest + self.random_config.ttl_margin)
+            ttl = min(max_hops, shortest + self.random_config.ttl_margin)
         else:
-            ttl = self.random_config.ttl_cap
+            ttl = max_hops
         current = start_cls_id
         path = [current]
         visited = {current}
         for hop in range(ttl + 1):
-            if hop >= ttl:
-                return (path, "") if current in exits else (path, "ttl_exceeded")
-            choices: list[int | None] = [None] if current in exits else []
+            choices: list[int | None] = [None] if current in exits and hop >= min_relay_hops else []
             remaining = ttl - hop - 1
-            for edge in current_isl_edges(snapshot, current):
-                if edge.dst_id in visited:
-                    continue
-                if informed:
-                    reachable = _shortest_hops(snapshot, edge.dst_id, exits, visited)
-                    if reachable is None or reachable > remaining:
+            if hop < ttl:
+                for edge in current_isl_edges(snapshot, current):
+                    if edge.dst_id in visited:
                         continue
-                choices.append(edge.dst_id)
+                    if informed:
+                        reachable = _shortest_hops(
+                            snapshot,
+                            edge.dst_id,
+                            exits,
+                            visited,
+                            min_relay_hops=max(min_relay_hops - hop - 1, 0),
+                            max_relay_hops=remaining,
+                        )
+                        if reachable is None:
+                            continue
+                    choices.append(edge.dst_id)
             if not choices:
-                return path, "no_available_next_hop"
+                return path, "ttl_exceeded" if hop >= ttl else "no_available_next_hop"
             selected = rng.choice(choices)
             if selected is None:
                 return path, ""
@@ -476,7 +505,12 @@ class RandomBaselineSimulator:
         residual_ratio = max(capacity - queue - already_injected, 0.0) / max(capacity, 1.0)
         injected_ratio = min((already_injected + other_rls_pressure) / max(capacity, 1.0), 1.0)
         exits = _future_exit_ids(task, future)
-        path, path_delay = shortest_isl_path(snapshot, edge.dst_id, exits)
+        path, path_delay = shortest_isl_path(
+            snapshot,
+            edge.dst_id,
+            exits,
+            min_relay_hops=self.config.min_cls_relay_hops,
+        )
         downstream = 1.0 if not path else min(path_delay / max(self.config.normalizer_delay_ms, 1.0), 1.0)
         distance = min(edge.distance_km / max(self.config.max_cross_layer_distance_km, 1.0), 1.0)
         return (
